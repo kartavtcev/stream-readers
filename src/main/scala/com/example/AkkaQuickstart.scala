@@ -19,8 +19,18 @@ object Generator {
 }
 
 object Protocol {
-  case class StreamChunk(stream : Stream[Char])
+  sealed trait Message
+  case class StreamChunk(stream : Stream[Char]) extends Message
+  object GetStreamChunk extends Message
+  case class SetKeyword(keyword: String) extends Message
 }
+
+sealed trait Status
+case class Success(bytes: Long) extends Status
+object Timeout extends Status
+case class Failure(exceptionMsg: String) extends Status
+
+case class WorkerInfo(elapsedMs: Option[Long], bytesCnt: Option[Long], status: Status)
 
 
 object Dispatcher {
@@ -30,19 +40,27 @@ object Dispatcher {
   //case object Greet
 }
 
-class Dispatcher(message: String, printerActor: ActorRef) extends Actor {
+class Dispatcher(var keyword: String = "", printerActor: ActorRef) extends Actor {
 
+  var workers = Map.empty[ActorRef, WorkerInfo]
   var queue : Queue[Char] = scala.collection.immutable.Queue.empty
 
-  //var greeting = ""
-
   def receive = {
-    //case WhoToGreet(who) =>
-      //greeting = message + ", " + who
-    //case Greet           =>
-      //printerActor ! Greeting(greeting)
     case Protocol.StreamChunk(stream) =>
+      stream.foreach{ c => queue = queue.enqueue(c) }
 
+    case Protocol.SetKeyword(word) =>
+      keyword = word
+
+    case Protocol.GetStreamChunk =>
+      if(queue.length > (keyword.length - 1) ) {   // FIX: the keyword was on the boundary & 1st worker got one part of the word, & 2nd worker got another part of the word
+
+        sender() ! Protocol.StreamChunk(queue.toStream)
+        queue = queue.take(keyword.length - 1)
+
+      } else {
+        sender() ! Protocol.StreamChunk(Stream.empty)
+      }
   }
 }
 
@@ -79,6 +97,8 @@ object AkkaQuickstart extends App {
   // Create the 'greeter' actors
   val dispatch: ActorRef =
     system.actorOf(Dispatcher.props("Howdy", printer), "howdyGreeter")
+
+  dispatch ! Protocol.SetKeyword(Generator.keyword)
 
   /*
   val helloGreeter: ActorRef =
