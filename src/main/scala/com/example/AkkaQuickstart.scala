@@ -23,6 +23,8 @@ object Protocol {
   case class StreamChunk(stream : Stream[Char]) extends Message
   object GetStreamChunk extends Message
   case class SetKeyword(keyword: String) extends Message
+  case class RegisterWorker(ref: ActorRef) extends Message
+  object Start extends Message
 }
 
 sealed trait Status
@@ -35,25 +37,25 @@ case class WorkerInfo(elapsedMs: Option[Long], bytesCnt: Option[Long], status: S
 
 object Dispatcher {
 
-  def props(message: String, printerActor: ActorRef): Props = Props(new Dispatcher(message, printerActor))
+  def props(keyword: String): Props = Props(new Dispatcher(keyword))
   //final case class WhoToGreet(who: String)
   //case object Greet
 }
 
-class Dispatcher(var keyword: String = "", printerActor: ActorRef) extends Actor {
+class Dispatcher(var keyword: String) extends Actor with ActorLogging {
 
-  var workers = Map.empty[ActorRef, WorkerInfo]
-  var queue : Queue[Char] = scala.collection.immutable.Queue.empty
+  var workers = Map.empty[ActorRef, Option[WorkerInfo]]
+  var queue: Queue[Char] = scala.collection.immutable.Queue.empty
 
   def receive = {
     case Protocol.StreamChunk(stream) =>
-      stream.foreach{ c => queue = queue.enqueue(c) }
+      stream.foreach { c => queue = queue.enqueue(c) }
 
     case Protocol.SetKeyword(word) =>
       keyword = word
 
     case Protocol.GetStreamChunk =>
-      if(queue.length > (keyword.length - 1) ) {   // FIX: the keyword was on the boundary & 1st worker got one part of the word, & 2nd worker got another part of the word
+      if (queue.length > (keyword.length - 1)) { // FIX: the keyword was on the boundary & 1st worker got one part of the word, & 2nd worker got another part of the word
 
         sender() ! Protocol.StreamChunk(queue.toStream)
         queue = queue.take(keyword.length - 1)
@@ -61,16 +63,20 @@ class Dispatcher(var keyword: String = "", printerActor: ActorRef) extends Actor
       } else {
         sender() ! Protocol.StreamChunk(Stream.empty)
       }
+
+    case Protocol.RegisterWorker(ref) =>
+      workers += (ref -> None)
   }
 }
 
-object Printer {
-  def props: Props = Props[Printer]
+object Worker {
+  def props: Props = Props[Worker]
   final case class Greeting(greeting: String)
 }
 
-class Printer extends Actor with ActorLogging {
-  import Printer._
+class Worker extends Actor with ActorLogging {
+
+  import Worker._
 
   def receive = {
     case Greeting(greeting) =>
@@ -80,6 +86,18 @@ class Printer extends Actor with ActorLogging {
 
 object AkkaQuickstart extends App {
 
+  val system: ActorSystem = ActorSystem("stream-readers-akka")
+
+  val dispatch: ActorRef =
+    system.actorOf(Dispatcher.props(Generator.keyword), "dispatcherActor")
+
+  dispatch ! Protocol.SetKeyword(Generator.keyword)
+
+  for(i <- 1 to 10) {
+    val worker: ActorRef = system.actorOf(Worker.props, s"workerActor#$i")
+    dispatch ! Protocol.RegisterWorker(worker)
+  }
+
   val randomStream = Source
     .tick(0.millis, 10.millis, "")
     .map {_ => Generator.randomStream }
@@ -88,17 +106,7 @@ object AkkaQuickstart extends App {
       dispatch ! _
     }
 
-  // Create the 'helloAkka' actor system
-  val system: ActorSystem = ActorSystem("helloAkka")
 
-  // Create the printer actor
-  val printer: ActorRef = system.actorOf(Printer.props, "printerActor")
-
-  // Create the 'greeter' actors
-  val dispatch: ActorRef =
-    system.actorOf(Dispatcher.props("Howdy", printer), "howdyGreeter")
-
-  dispatch ! Protocol.SetKeyword(Generator.keyword)
 
   /*
   val helloGreeter: ActorRef =
