@@ -4,7 +4,6 @@ import java.time._
 import java.time.temporal.ChronoUnit
 
 import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
-import akka.event.{Logging, LoggingAdapter}
 import akka.pattern.ask
 import akka.stream.ActorMaterializer
 import akka.stream.scaladsl.Source
@@ -21,7 +20,7 @@ object Generator {
 
   def randomStream : Stream[Char] = {
     def stream = Random.alphanumeric take Random.nextInt(100)
-    if(Random.nextInt(100) < 1) stream #::: keyword.toStream
+    if(Random.nextInt(1000) == 1) stream #::: keyword.toStream
     else stream
   }
 }
@@ -32,46 +31,54 @@ object Protocol {
   object GetStreamChunk extends Message
   case class SetKeyword(keyword: String) extends Message
   case class RegisterWorker(ref: ActorRef) extends Message
-  object Start extends Message
-  case class ReadStream(tick: LocalDateTime) extends Message
+  object ReadStream extends Message
 
   sealed trait Status
-  object Success extends Status
-  object Timeout extends Status
-  case class Failure(exceptionMsg: String) extends Status
+  object Success extends Status {
+    override def toString: String = "Success"
+  }
+  object Timeout extends Status {
+    override def toString: String = "Timeout"
+  }
+  case class Failure(exceptionMsg: String) extends Status {
+    override def toString: String = "Failure"
+  }
 
   case class WorkerInfo(selfRef : ActorRef, elapsedMs: Option[Long], bytesCnt: Option[Long], status: Status) extends Message
 }
 
 
-
-
 object Dispatcher {
 
-  def props(logger: LoggingAdapter, keyword: String): Props = Props(new Dispatcher(logger, keyword))
-  //final case class WhoToGreet(who: String)
-  //case object Greet
+  def props(keyword: String): Props = Props(new Dispatcher(keyword))
 }
 
-class Dispatcher(val logger: LoggingAdapter, var keyword: String) extends Actor with ActorLogging {
+class Dispatcher(var keyword: String) extends Actor with ActorLogging {
 
   var workers = Map.empty[ActorRef, Option[Protocol.WorkerInfo]]
   var queue: Queue[Char] = scala.collection.immutable.Queue.empty
+  var isTimeout = false
 
   def receive = {
     case Protocol.StreamChunk(stream) =>
-      stream.foreach { c => queue = queue.enqueue(c) }
+      if(!isTimeout) {
+        stream.foreach { c => queue = queue.enqueue(c) }
+      }
 
     case Protocol.SetKeyword(word) =>
+      log.debug("dispatcher got keyword")
       keyword = word
 
     case Protocol.GetStreamChunk =>
-      if (queue.length > (keyword.length - 1)) { // FIX: the keyword was on the boundary & 1st worker got one part of the word, & 2nd worker got another part of the word
+      if (queue.length > (keyword.length - 1)) { // FIXED: the keyword was on the boundary & 1st worker got one part of the word, & 2nd worker got another part of the word
 
-        sender() ! Protocol.StreamChunk(queue.toStream)
+        val qs =  queue.toStream
+        log.debug(s"dispatcher sent-out a stream-chunk ${qs.mkString}")
+        sender() ! Protocol.StreamChunk(qs)
         queue = queue.take(keyword.length - 1)
 
       } else {
+        log.debug(s"dispatcher sent-out empty stream-chunk")
         sender() ! Protocol.StreamChunk(Stream.empty)
       }
 
@@ -79,71 +86,95 @@ class Dispatcher(val logger: LoggingAdapter, var keyword: String) extends Actor 
       workers += (ref -> None)
 
     case wi : Protocol.WorkerInfo =>
+      log.debug(s"dispatcher got worker-info:\n$wi")
       workers -= wi.selfRef
       workers += wi.selfRef -> Some(wi)
 
     case Protocol.Timeout =>
-      ()  // TODO: ADD LOGGING
+      isTimeout = true
+      log.debug("dispatcher got timeout")
+
+      val workersSuccess = workers.values
+        .collect{ case Some(wi) => wi }
+        .collect{ case wi @ Protocol.WorkerInfo(_, Some(_), Some(_), _) => wi }
+        .toList
+        .sortBy((- _.elapsedMs.get))
+
+      val workersFail = workers.values
+        .collect{ case Some(wi) => wi }
+        .collect{ case wi @ Protocol.WorkerInfo(_, None, None, _) => wi }
+        .toList
+
+      workersSuccess.foreach { wi =>
+        log.info(s"${wi.elapsedMs.get} ${wi.bytesCnt.get} ${wi.status} ${wi.selfRef}")
+      }
+
+      workersFail.foreach { wi =>
+        log.info(s"${wi.status} ${wi.selfRef}")
+      }
+
+      val stat = workersSuccess.foldLeft((0L,0L))((acc, wi) => (acc._1 + wi.elapsedMs.get, acc._2 + wi.bytesCnt.get))
+      log.info(s"Average bytes read per second: ${(stat._2.toFloat / stat._1.toFloat) * 1000}\n\n")
   }
 }
 
 object Worker {
-  def props(logger: LoggingAdapter, dispatcherRef : ActorRef): Props = Props(new Worker(logger, dispatcherRef))
-  final case class Greeting(greeting: String)
+  def props(dispatcherRef : ActorRef): Props = Props(new Worker(dispatcherRef))
 }
 
-class Worker(val logger: LoggingAdapter, val dispatcherRef: ActorRef) extends Actor with ActorLogging {
+class Worker(val dispatcherRef: ActorRef) extends Actor with ActorLogging {
 
   implicit val timeout: Timeout = Timeout(1 seconds)
 
   var numberOfBytesRead : Long = 0
-  var finished : Boolean = false
+  var isFinished = false
   var started: Option[LocalDateTime] = None
 
   def receive = {
-    case Protocol.ReadStream(tick) =>
+    case Protocol.ReadStream =>
 
       started match {
-        case None => started = Some(tick)
+        case None => started = Some(LocalDateTime.now)
         case Some(_) => ()
       }
 
-      if(!finished) {
-        (dispatcherRef ? Protocol.GetStreamChunk) foreach { chunk =>
-          val str = chunk.toString()
+      if(!isFinished) {
+        (dispatcherRef ? Protocol.GetStreamChunk) map { case Protocol.StreamChunk (chunk) =>
+          val str = chunk.mkString
+          log.debug(s"worker got a chunk of stream: $str")
           numberOfBytesRead += str.length()
           if (str.contains(Generator.keyword)) {
-            finished = true
-            dispatcherRef ! Protocol.WorkerInfo(self, Some(ChronoUnit.MILLIS.between(started.get, tick)), Some(numberOfBytesRead), Protocol.Success)
+            isFinished = true
+            dispatcherRef ! Protocol.WorkerInfo(self, Some(ChronoUnit.MILLIS.between(started.get, LocalDateTime.now)), Some(numberOfBytesRead), Protocol.Success)
           }
         }
       }
 
     case Protocol.Timeout =>
-      if(!finished) {
-        finished = true
+      if(!isFinished) {
+        isFinished = true
+        log.debug("worker got timeout")
         dispatcherRef ! Protocol.WorkerInfo(self, None, None, Protocol.Timeout)
       }
   }
 }
 
-object StreamReaders extends App {
+object StreamReaders extends App {    // TODO: Error handling
 
   implicit val system: ActorSystem = ActorSystem("stream-readers-akka")
   implicit val materializer: ActorMaterializer = ActorMaterializer()
 
+  val defaultWorkerTimeout = 60 seconds
+  val defaultDispatcherTimeout = 70 seconds
+  val terminateActorSystemTimeout = 80 seconds
 
-  val defaultTimeout = 60 seconds
-
-  lazy val log = Logging(system, classOf[App])
-
+  // TODO: Enter timeout from the console
 
   val dispatch: ActorRef =
-    system.actorOf(Dispatcher.props(log, Generator.keyword), "dispatcherActor")
+    system.actorOf(Dispatcher.props(Generator.keyword), "dispatcherActor")
 
   dispatch ! Protocol.SetKeyword(Generator.keyword)
 
-  //val randomStream =
   Source
     .tick(0.millis, 10.millis, "")
     .map {_ => Generator.randomStream }
@@ -151,96 +182,29 @@ object StreamReaders extends App {
     .runForeach {
       dispatch ! Protocol.StreamChunk(_)
     }
-  //var cancelables : List[akka.actor.Cancellable] = List.empty
 
   for(i <- 1 to 10) {
 
-    val worker: ActorRef = system.actorOf(Worker.props(log, dispatch), s"workerActor#$i")
+    val worker: ActorRef = system.actorOf(Worker.props(dispatch), s"workerActor-number-$i")
     dispatch ! Protocol.RegisterWorker(worker)
 
-    //val cancellable =
     system.scheduler.schedule(
         0 milliseconds,
         100 milliseconds,
         worker,
-        Protocol.ReadStream(LocalDateTime.now))
-    //cancelables = cancelables :+ cancellable
+        Protocol.ReadStream)
 
-    system.scheduler.scheduleOnce(defaultTimeout) {
+    system.scheduler.scheduleOnce(defaultWorkerTimeout) {
       worker !  Protocol.Timeout
     }
   }
 
-  system.scheduler.scheduleOnce(defaultTimeout) {
+  system.scheduler.scheduleOnce(defaultDispatcherTimeout) {
     dispatch ! Protocol.Timeout
   }
 
 
-
-
-
-
-
-
-
-
-
-  /*
-  val helloGreeter: ActorRef =
-    system.actorOf(Greeter.props("Hello", printer), "helloGreeter")
-  val goodDayGreeter: ActorRef =
-    system.actorOf(Greeter.props("Good day", printer), "goodDayGreeter")
-
-  howdyGreeter ! WhoToGreet("Akka")
-  howdyGreeter ! Greet
-
-  howdyGreeter ! WhoToGreet("Lightbend")
-  howdyGreeter ! Greet
-
-  helloGreeter ! WhoToGreet("Scala")
-  helloGreeter ! Greet
-
-  goodDayGreeter ! WhoToGreet("Play")
-  goodDayGreeter ! Greet
-  */
-}
-
-/*
-object Buncher {
-  trait Msg
-  final case class Batch(messages: Vector[Msg])
-
-  private case object TimerKey
-  private case object Timeout extends Msg
-
-  def behavior(target: ActorRef[Batch], after: FiniteDuration, maxSize: Int): Behavior[Msg] =
-    Actor.withTimers(timers => idle(timers, target, after, maxSize))
-
-  private def idle(timers: TimerScheduler[Msg], target: ActorRef[Batch],
-                   after: FiniteDuration, maxSize: Int): Behavior[Msg] = {
-    Actor.immutable[Msg] { (ctx, msg) =>
-      timers.startSingleTimer(TimerKey, Timeout, after)
-      active(Vector(msg), timers, target, after, maxSize)
-    }
-  }
-
-  private def active(buffer: Vector[Msg], timers: TimerScheduler[Msg],
-                     target: ActorRef[Batch], after: FiniteDuration, maxSize: Int): Behavior[Msg] = {
-    Actor.immutable[Msg] { (ctx, msg) =>
-      msg match {
-        case Timeout =>
-          target ! Batch(buffer)
-          idle(timers, target, after, maxSize)
-        case msg =>
-          val newBuffer = buffer :+ msg
-          if (newBuffer.size == maxSize) {
-            timers.cancel(TimerKey)
-            target ! Batch(newBuffer)
-            idle(timers, target, after, maxSize)
-          } else
-            active(newBuffer, timers, target, after, maxSize)
-      }
-    }
+  system.scheduler.scheduleOnce(terminateActorSystemTimeout) {
+    system.terminate()
   }
 }
-*/
