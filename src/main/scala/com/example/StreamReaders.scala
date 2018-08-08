@@ -1,15 +1,19 @@
 package com.example
 
-
-import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
-import akka.pattern.ask
-import akka.stream.scaladsl.Source
-
-import scala.collection.immutable.Queue
-import scala.concurrent.duration._
-import scala.util.Random
 import java.time._
 import java.time.temporal.ChronoUnit
+
+import akka.actor.{Actor, ActorLogging, ActorRef, ActorSystem, Props}
+import akka.event.{Logging, LoggingAdapter}
+import akka.pattern.ask
+import akka.stream.ActorMaterializer
+import akka.stream.scaladsl.Source
+import akka.util.Timeout
+
+import scala.collection.immutable.Queue
+import scala.concurrent.ExecutionContext.Implicits.global
+import scala.concurrent.duration._
+import scala.util.Random
 
 
 object Generator {
@@ -30,26 +34,28 @@ object Protocol {
   case class RegisterWorker(ref: ActorRef) extends Message
   object Start extends Message
   case class ReadStream(tick: LocalDateTime) extends Message
+
+  sealed trait Status
+  object Success extends Status
+  object Timeout extends Status
+  case class Failure(exceptionMsg: String) extends Status
+
+  case class WorkerInfo(selfRef : ActorRef, elapsedMs: Option[Long], bytesCnt: Option[Long], status: Status) extends Message
 }
 
-sealed trait Status
-object Success extends Status
-object Timeout extends Status
-case class Failure(exceptionMsg: String) extends Status
 
-case class WorkerInfo(elapsedMs: Option[Long], bytesCnt: Option[Long], status: Status)
 
 
 object Dispatcher {
 
-  def props(keyword: String): Props = Props(new Dispatcher(keyword))
+  def props(logger: LoggingAdapter, keyword: String): Props = Props(new Dispatcher(logger, keyword))
   //final case class WhoToGreet(who: String)
   //case object Greet
 }
 
-class Dispatcher(var keyword: String) extends Actor with ActorLogging {
+class Dispatcher(val logger: LoggingAdapter, var keyword: String) extends Actor with ActorLogging {
 
-  var workers = Map.empty[ActorRef, Option[WorkerInfo]]
+  var workers = Map.empty[ActorRef, Option[Protocol.WorkerInfo]]
   var queue: Queue[Char] = scala.collection.immutable.Queue.empty
 
   def receive = {
@@ -72,18 +78,24 @@ class Dispatcher(var keyword: String) extends Actor with ActorLogging {
     case Protocol.RegisterWorker(ref) =>
       workers += (ref -> None)
 
-    case WorkerInfo(elapsedMs, bytesCnt, status) => ()
+    case wi : Protocol.WorkerInfo =>
+      workers -= wi.selfRef
+      workers += wi.selfRef -> Some(wi)
+
+    case Protocol.Timeout =>
+      ()  // TODO: ADD LOGGING
   }
 }
 
 object Worker {
-  def props(dispatcherRef : ActorRef): Props = Props(new Worker(dispatcherRef))
+  def props(logger: LoggingAdapter, dispatcherRef : ActorRef): Props = Props(new Worker(logger, dispatcherRef))
   final case class Greeting(greeting: String)
 }
 
-class Worker(val dispatcherRef: ActorRef) extends Actor with ActorLogging {
+class Worker(val logger: LoggingAdapter, val dispatcherRef: ActorRef) extends Actor with ActorLogging {
 
-  import Worker._
+  implicit val timeout: Timeout = Timeout(1 seconds)
+
   var numberOfBytesRead : Long = 0
   var finished : Boolean = false
   var started: Option[LocalDateTime] = None
@@ -102,29 +114,32 @@ class Worker(val dispatcherRef: ActorRef) extends Actor with ActorLogging {
           numberOfBytesRead += str.length()
           if (str.contains(Generator.keyword)) {
             finished = true
-            dispatcherRef ! WorkerInfo(Some(ChronoUnit.MILLIS.between(started.get, tick)), Some(numberOfBytesRead), Success)
-
+            dispatcherRef ! Protocol.WorkerInfo(self, Some(ChronoUnit.MILLIS.between(started.get, tick)), Some(numberOfBytesRead), Protocol.Success)
           }
         }
       }
 
-    case Timeout => ()
-
-
-    case Greeting(greeting) =>
-      log.info("Greeting received (from " + sender() + "): " + greeting)
-
+    case Protocol.Timeout =>
+      if(!finished) {
+        finished = true
+        dispatcherRef ! Protocol.WorkerInfo(self, None, None, Protocol.Timeout)
+      }
   }
 }
 
 object StreamReaders extends App {
 
-  val system: ActorSystem = ActorSystem("stream-readers-akka")
+  implicit val system: ActorSystem = ActorSystem("stream-readers-akka")
+  implicit val materializer: ActorMaterializer = ActorMaterializer()
+
+
   val defaultTimeout = 60 seconds
+
+  lazy val log = Logging(system, classOf[App])
 
 
   val dispatch: ActorRef =
-    system.actorOf(Dispatcher.props(Generator.keyword), "dispatcherActor")
+    system.actorOf(Dispatcher.props(log, Generator.keyword), "dispatcherActor")
 
   dispatch ! Protocol.SetKeyword(Generator.keyword)
 
@@ -136,26 +151,28 @@ object StreamReaders extends App {
     .runForeach {
       dispatch ! Protocol.StreamChunk(_)
     }
-
-  import system.dispatcher
   //var cancelables : List[akka.actor.Cancellable] = List.empty
 
   for(i <- 1 to 10) {
 
-    val worker: ActorRef = system.actorOf(Worker.props(dispatch), s"workerActor#$i")
+    val worker: ActorRef = system.actorOf(Worker.props(log, dispatch), s"workerActor#$i")
     dispatch ! Protocol.RegisterWorker(worker)
 
     //val cancellable =
     system.scheduler.schedule(
-        50 milliseconds,
+        0 milliseconds,
         100 milliseconds,
         worker,
         Protocol.ReadStream(LocalDateTime.now))
     //cancelables = cancelables :+ cancellable
 
     system.scheduler.scheduleOnce(defaultTimeout) {
-      worker !  Timeout(LocalDateTime.now)
+      worker !  Protocol.Timeout
     }
+  }
+
+  system.scheduler.scheduleOnce(defaultTimeout) {
+    dispatch ! Protocol.Timeout
   }
 
 
